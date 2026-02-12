@@ -170,7 +170,7 @@ repositories:
     labels: [bug, enhancement]
     max_issues: 30
     language: python
-  
+
   - name: owner/repo2
     labels: [bug]
     max_issues: 20
@@ -445,7 +445,7 @@ python batch_collect.py \
   --max-issues 30 \
   --output python_bugs.json
 
-# JavaScript bugs  
+# JavaScript bugs
 python batch_collect.py \
   --repos axios/axios lodash/lodash \
   --language javascript \
@@ -477,6 +477,7 @@ python filter_dataset.py raw_dataset.json \
 ### Rate Limits
 
 GitHub API has rate limits:
+
 - **Authenticated**: 5,000 requests/hour
 - **Unauthenticated**: 60 requests/hour
 
@@ -485,12 +486,14 @@ The collector automatically monitors and warns about rate limits. If you hit the
 ### Choosing Repositories
 
 Good repositories for test generation research:
+
 - **Active projects** with regular bug fixes
 - **Well-labeled issues** (bug, enhancement, etc.)
 - **Clear issue descriptions** with reproduction steps
 - **Small to medium size** (easier to understand context)
 
 Examples:
+
 - Python: `requests`, `flask`, `click`, `httpie/cli`
 - JavaScript: `axios`, `lodash`, `express`
 - Java: `spring-boot`, `junit5`
@@ -498,6 +501,7 @@ Examples:
 ### Data Quality
 
 For best results:
+
 1. **Filter by complexity** - Start with simple bugs (1-3 files, <50 changes)
 2. **Exclude test-only changes** - Focus on source code bugs
 3. **Check descriptions** - Issues with clear reproduction steps work best
@@ -506,11 +510,13 @@ For best results:
 ### Storage
 
 Datasets can get large:
+
 - **50 issues**: ~5-10 MB
 - **500 issues**: ~50-100 MB
 - **5000 issues**: ~500 MB - 1 GB
 
 Consider:
+
 - Filtering before saving
 - Using `--export-simple` for overview
 - Compressing large datasets
@@ -518,6 +524,7 @@ Consider:
 ## 🐛 Troubleshooting
 
 **Rate limit errors:**
+
 ```bash
 # Check your rate limit
 curl -H "Authorization: token YOUR_TOKEN" \
@@ -527,16 +534,19 @@ curl -H "Authorization: token YOUR_TOKEN" \
 ```
 
 **No PRs found:**
+
 - Repository may not link issues to PRs
 - Try different label combinations
 - Check if issues are actually closed with fixes
 
 **Import errors:**
+
 ```bash
 pip install -r requirements.txt
 ```
 
 **Token authentication failed:**
+
 - Verify token is valid: https://github.com/settings/tokens
 - Check token has `repo` scope
 - Make sure it's exported: `echo $GITHUB_TOKEN`
@@ -553,6 +563,7 @@ pip install -r requirements.txt
 ## 🤝 Contributing
 
 Ideas for improvements:
+
 - Add more language support
 - Better PR detection algorithms
 - Integration with test generation tools
@@ -582,12 +593,14 @@ python generate_tests_local.py clean_dataset.json --max-issues 1
 ```
 
 **What it does:**
+
 1. Clones the repository locally
 2. Generates test with LLM (Chain of Thought)
 3. Checks out buggy commit → runs test (should FAIL ❌)
 4. Checks out fixed commit → runs test (should PASS ✅)
 
 **Prerequisites:**
+
 - Git installed
 - `pip install pytest` (for Python repos)
 - Sufficient disk space for cloned repos
@@ -604,11 +617,13 @@ python generate_tests.py dataset.json --skip-execution
 ```
 
 **What it does:**
+
 - Generates test code with Chain of Thought
 - Generates fix code with Chain of Thought
 - Saves everything to JSON (no execution)
 
 **Prerequisites:**
+
 - Just `pip install anthropic`
 
 #### 3. Sandbox Simulation Mode
@@ -621,6 +636,7 @@ python generate_tests.py dataset.json
 ```
 
 **What it does:**
+
 - Generates test + fix with LLM
 - Runs both in temporary sandbox
 - Good for quick checks
@@ -677,6 +693,7 @@ test_repos/                     # Cloned repositories
 ```
 
 **For detailed guides:**
+
 - 📘 [LOCAL_TESTING_GUIDE.md](LOCAL_TESTING_GUIDE.md) - Complete local testing guide
 - 📊 [MODE_COMPARISON.md](MODE_COMPARISON.md) - Choose the right mode
 - ⚡ [QUICK_REFERENCE.md](QUICK_REFERENCE.md) - Quick command reference
