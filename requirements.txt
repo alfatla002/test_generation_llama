@@ -1,5 +1,0 @@
-PyGithub>=2.1.1
-PyYAML>=6.0
-requests>=2.31.0
-langdetect>=1.0.9
-anthropic>=0.40.0
