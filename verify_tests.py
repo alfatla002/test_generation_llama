@@ -18,6 +18,20 @@ def run_command(cmd, cwd=None, timeout=120):
     }
 
 
+def install_project_dependencies(clone_dir):
+    """Install project deps and ensure package imports resolve for tests."""
+    clone_dir = Path(clone_dir)
+    if (clone_dir / "package.json").exists():
+        run_command("npm install --silent 2>/dev/null", cwd=clone_dir, timeout=180)
+        return
+
+    # Python projects often use pyproject.toml + src layout.
+    if (clone_dir / "requirements.txt").exists():
+        run_command("python -m pip install -r requirements.txt -q", cwd=clone_dir, timeout=240)
+    if (clone_dir / "pyproject.toml").exists() or (clone_dir / "setup.py").exists():
+        run_command("python -m pip install -e . -q", cwd=clone_dir, timeout=240)
+
+
 def verify_single_test(repo_url, test_info, workspace="workspace"):
     """
     Verify a single test follows the fail-to-pass pattern:
@@ -59,12 +73,7 @@ def verify_single_test(repo_url, test_info, workspace="workspace"):
 
     # ── Step 4: Install dependencies (adapt per project) ──
     print("📦 Installing dependencies...")
-    if (clone_dir / "package.json").exists():
-        run_command("npm install --silent 2>/dev/null", cwd=clone_dir, timeout=180)
-    elif (clone_dir / "requirements.txt").exists():
-        run_command("pip install -r requirements.txt -q", cwd=clone_dir, timeout=180)
-    elif (clone_dir / "setup.py").exists():
-        run_command("pip install -e . -q", cwd=clone_dir, timeout=180)
+    install_project_dependencies(clone_dir)
 
     # ── Step 5: Run test on BUGGY code (expect FAIL) ──
     print("🧪 Running test on BUGGY code (should FAIL)...")
@@ -87,8 +96,7 @@ def verify_single_test(repo_url, test_info, workspace="workspace"):
     shutil.copy(test_source, test_dest)
 
     # Re-install deps if needed
-    if (clone_dir / "package.json").exists():
-        run_command("npm install --silent 2>/dev/null", cwd=clone_dir, timeout=180)
+    install_project_dependencies(clone_dir)
 
     # ── Step 7: Run test on FIXED code (expect PASS) ──
     print("🧪 Running test on FIXED code (should PASS)...")

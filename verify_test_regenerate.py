@@ -1,25 +1,75 @@
 # verify_tests.py
-# Enhanced with iterative test regeneration using Claude API
+# Enhanced with iterative test regeneration using Ollama API
 # If a test doesn't achieve fail-to-pass, it captures the error context
-# and asks Claude to fix/regenerate the test, up to MAX_RETRIES times.
+# and asks the model to fix/regenerate the test, up to MAX_RETRIES times.
 
 import subprocess
 import json
 import shutil
 import re
 import os
+import ast
 from pathlib import Path
 from datetime import datetime
 
-import anthropic
+import requests
 
 # ─── Configuration ───────────────────────────────────────────────
 MAX_RETRIES = 3                    # max regeneration attempts per test
-MODEL = "claude-sonnet-4-20250514"  # claude model for regeneration
-MAX_TOKENS = 4096
+MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "4096"))
 TIMEOUT_SECONDS = 120
 DEP_INSTALL_TIMEOUT = 180
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.1"))
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "1200"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 # ─────────────────────────────────────────────────────────────────
+
+
+def _ollama_base_urls():
+    urls = []
+    primary = OLLAMA_BASE_URL.rstrip("/")
+    urls.append(primary)
+    if "127.0.0.1:11434" in primary or "localhost:11434" in primary:
+        # WSL fallback: Windows host is usually the resolver nameserver.
+        try:
+            resolv = Path("/etc/resolv.conf").read_text()
+            for line in resolv.splitlines():
+                if line.startswith("nameserver "):
+                    ip = line.split()[1].strip()
+                    if ip:
+                        urls.append(f"http://{ip}:11434")
+                    break
+        except Exception:
+            pass
+    return list(dict.fromkeys(urls))
+
+
+def _ollama_chat(messages, system_prompt):
+    payload = {
+        "model": MODEL,
+        "stream": False,
+        "messages": [{"role": "system", "content": system_prompt}] + messages,
+        "options": {
+            "temperature": OLLAMA_TEMPERATURE,
+            "num_ctx": OLLAMA_NUM_CTX,
+            "num_predict": MAX_TOKENS,
+        },
+    }
+    last_error = None
+    for base in _ollama_base_urls():
+        try:
+            response = requests.post(
+                f"{base}/api/chat",
+                json=payload,
+                timeout=OLLAMA_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            last_error = f"{base}: {e}"
+    raise RuntimeError(f"Ollama request failed for all endpoints. Last error: {last_error}")
 
 
 def run_command(cmd, cwd=None, timeout=TIMEOUT_SECONDS):
@@ -69,12 +119,12 @@ def install_dependencies(clone_dir):
     clone_dir = Path(clone_dir)
     if (clone_dir / "package.json").exists():
         run_command("npm install --silent 2>/dev/null", cwd=clone_dir, timeout=DEP_INSTALL_TIMEOUT)
-    elif (clone_dir / "requirements.txt").exists():
-        run_command("pip install -r requirements.txt -q", cwd=clone_dir, timeout=DEP_INSTALL_TIMEOUT)
-    elif (clone_dir / "pyproject.toml").exists():
-        run_command("pip install -e . -q", cwd=clone_dir, timeout=DEP_INSTALL_TIMEOUT)
-    elif (clone_dir / "setup.py").exists():
-        run_command("pip install -e . -q", cwd=clone_dir, timeout=DEP_INSTALL_TIMEOUT)
+        return
+
+    if (clone_dir / "requirements.txt").exists():
+        run_command("python -m pip install -r requirements.txt -q", cwd=clone_dir, timeout=DEP_INSTALL_TIMEOUT)
+    if (clone_dir / "pyproject.toml").exists() or (clone_dir / "setup.py").exists():
+        run_command("python -m pip install -e . -q", cwd=clone_dir, timeout=DEP_INSTALL_TIMEOUT)
 
 
 def run_test_at_commit(clone_dir, commit_sha, test_source, suggested_path, label=""):
@@ -101,6 +151,14 @@ def run_test_at_commit(clone_dir, commit_sha, test_source, suggested_path, label
 
     # Run test
     test_cmd = detect_test_command(clone_dir, suggested_path)
+    if suggested_path.endswith(".py"):
+        collect_cmd = f"python -m pytest {suggested_path} --collect-only -q"
+        collect_result = run_command(collect_cmd, cwd=clone_dir, timeout=TIMEOUT_SECONDS)
+        if collect_result["returncode"] != 0:
+            collect_result["preflight_collect_failed"] = True
+            collect_result["test_cmd"] = collect_cmd
+            print(f"  {label}: ✗ FAIL (collect-only)")
+            return False, collect_result
     print(f"  Running: {test_cmd}")
     result = run_command(test_cmd, cwd=clone_dir, timeout=TIMEOUT_SECONDS)
     passed = result["returncode"] == 0
@@ -124,6 +182,7 @@ def diagnose_failure(status, pre_result, post_result, test_code):
         "pre_fix_output": "",
         "post_fix_output": "",
         "error_locations": [],
+        "missing_modules": _extract_missing_modules(pre_result, post_result),
     }
 
     if status == "PASS_TO_PASS":
@@ -135,7 +194,7 @@ def diagnose_failure(status, pre_result, post_result, test_code):
         )
         diagnosis["pre_fix_output"] = _format_output(pre_result)
 
-    elif status == "FAIL_TO_FAIL":
+    elif status in ("FAIL_TO_FAIL", "FAIL_TO_FAIL_ENV", "FAIL_TO_FAIL_IMPORT"):
         diagnosis["problem"] = (
             "The test FAILED on BOTH the buggy and fixed code. "
             "This likely means the test itself has errors (syntax errors, "
@@ -149,6 +208,11 @@ def diagnose_failure(status, pre_result, post_result, test_code):
         diagnosis["error_locations"] = _extract_error_locations(
             pre_result, post_result, test_code
         )
+        if diagnosis["missing_modules"]:
+            diagnosis["problem"] += (
+                " Optional dependencies are missing in the environment; "
+                "test should avoid hard dependency on optional modules."
+            )
 
     elif status == "PASS_TO_FAIL":
         diagnosis["problem"] = (
@@ -172,6 +236,191 @@ def _format_output(result):
     if result.get("stdout"):
         parts.append(f"STDOUT:\n{result['stdout']}")
     return "\n\n".join(parts) if parts else "No output captured"
+
+
+def _extract_missing_modules(*results):
+    missing = set()
+    for result in results:
+        if not result:
+            continue
+        blob = (result.get("stdout", "") or "") + "\n" + (result.get("stderr", "") or "")
+        for m in re.finditer(r"ModuleNotFoundError:\s+No module named ['\"]([^'\"]+)['\"]", blob):
+            missing.add(m.group(1))
+    return sorted(missing)
+
+
+def _normalize_python_test_code(code_text):
+    """Apply lightweight fixes for common import omissions in generated tests."""
+    if not code_text:
+        return code_text
+    out = code_text
+    needs_pytest = "pytest." in out and not re.search(
+        r"^\s*(?:import\s+pytest\b|from\s+pytest\b)",
+        out,
+        re.MULTILINE,
+    )
+    if needs_pytest:
+        lines = out.splitlines()
+        insert_at = 0
+        if lines and lines[0].startswith("#!"):
+            insert_at = 1
+        while insert_at < len(lines) and (
+            lines[insert_at].strip().startswith("#") or not lines[insert_at].strip()
+        ):
+            insert_at += 1
+        lines.insert(insert_at, "import pytest")
+        out = "\n".join(lines).rstrip() + "\n"
+    return out
+
+
+def _expand_missing_module_prefixes(missing_modules):
+    expanded = set()
+    for mod in missing_modules:
+        parts = mod.split(".")
+        for i in range(1, len(parts) + 1):
+            expanded.add(".".join(parts[:i]))
+    return sorted(expanded)
+
+
+def _discover_repo_top_level_modules(clone_dir):
+    """Best-effort discovery of repo-owned top-level Python package names."""
+    clone_dir = Path(clone_dir)
+    tops = set()
+    src_dir = clone_dir / "src"
+    if src_dir.exists():
+        for p in src_dir.iterdir():
+            if p.is_dir() and re.match(r"^[A-Za-z_]\w*$", p.name):
+                tops.add(p.name)
+    for p in clone_dir.iterdir():
+        if p.is_dir() and (p / "__init__.py").exists() and re.match(r"^[A-Za-z_]\w*$", p.name):
+            tops.add(p.name)
+    return tops
+
+
+def _filter_shimmable_modules(missing_modules, clone_dir):
+    """
+    Only shim likely external optional deps, never repo-owned package modules.
+    """
+    repo_tops = _discover_repo_top_level_modules(clone_dir)
+    shimmable = []
+    for mod in missing_modules:
+        top = mod.split(".")[0]
+        if top in repo_tops:
+            continue
+        shimmable.append(mod)
+    return sorted(set(shimmable))
+
+
+def _inject_missing_module_shims(code_text, missing_modules):
+    """
+    Insert a lightweight optional-dependency shim preamble for missing modules.
+    This avoids collection-time import crashes on optional integrations.
+    """
+    if not code_text or not missing_modules:
+        return code_text
+    marker = "# AUTO-OPTIONAL-DEP-SHIMS"
+    if marker in code_text:
+        return code_text
+
+    shim_block = (
+        f"{marker}\n"
+        "import sys\n"
+        "import types\n\n"
+        f"_MISSING_OPTIONAL_MODULES = {json.dumps(_expand_missing_module_prefixes(sorted(set(missing_modules))))}\n\n"
+        "def _install_module_chain(mod_name):\n"
+        "    parts = mod_name.split('.')\n"
+        "    for i in range(1, len(parts) + 1):\n"
+        "        name = '.'.join(parts[:i])\n"
+        "        if name not in sys.modules:\n"
+        "            module = types.ModuleType(name)\n"
+        "            module.__path__ = []\n"
+        "            module.__package__ = name.rpartition('.')[0]\n"
+        "            def _fallback_attr(attr_name, _name=name):\n"
+        "                if attr_name == '__path__':\n"
+        "                    return []\n"
+        "                return type(attr_name, (), {})\n"
+        "            module.__getattr__ = _fallback_attr\n"
+        "            sys.modules[name] = module\n"
+        "    for i in range(1, len(parts)):\n"
+        "        parent = '.'.join(parts[:i])\n"
+        "        child = parts[i]\n"
+        "        full = '.'.join(parts[:i + 1])\n"
+        "        setattr(sys.modules[parent], child, sys.modules[full])\n\n"
+        "for _mod in _MISSING_OPTIONAL_MODULES:\n"
+        "    _install_module_chain(_mod)\n\n"
+    )
+
+    if code_text.startswith("#!"):
+        lines = code_text.splitlines(True)
+        return lines[0] + shim_block + "".join(lines[1:])
+    return shim_block + code_text
+
+
+def _sanitize_test_code(text):
+    """Extract clean code and strip markdown fences/prose artifacts."""
+    if not text:
+        return ""
+    blocks = re.findall(r"```(?:[\w.+-]+)?\n(.*?)```", text, re.DOTALL)
+    candidate = blocks[0] if blocks else text
+    lines = [ln for ln in candidate.splitlines() if not ln.strip().startswith("```")]
+
+    # Drop leading prose and keep from first code-like line.
+    code_start = 0
+    code_markers = ("#", "import ", "from ", "def ", "class ", "@", "async ", "if __name__", '"""', "'''")
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(code_markers):
+            code_start = i
+            break
+    cleaned_lines = lines[code_start:]
+    cleaned = "\n".join(cleaned_lines).strip()
+    return cleaned + "\n" if cleaned else ""
+
+
+def _has_repeated_bad_pattern(candidate_code, diagnosis):
+    """Reject regenerated outputs that repeat known failing assertion patterns."""
+    outputs = (diagnosis.get("pre_fix_output", "") or "") + "\n" + (diagnosis.get("post_fix_output", "") or "")
+    if "ImportError not raised" in outputs:
+        if "assertRaises(ImportError)" in candidate_code or "pytest.raises(ImportError)" in candidate_code:
+            return True, "repeated ImportError assertion pattern"
+    return False, ""
+
+
+def _is_no_progress(attempt_history):
+    """Detect repeated attempts with unchanged outcomes/output tails."""
+    if len(attempt_history) < 2:
+        return False
+    prev = attempt_history[-2]
+    cur = attempt_history[-1]
+    return (
+        prev.get("status") == cur.get("status")
+        and prev.get("pre_fix_stdout") == cur.get("pre_fix_stdout")
+        and prev.get("post_fix_stdout") == cur.get("post_fix_stdout")
+    )
+
+
+def _should_force_strict_mode(attempt_history):
+    """
+    Switch to strict rewrite mode after two failed attempts with no progress.
+    """
+    if len(attempt_history) < 2:
+        return False
+    last = attempt_history[-1]
+    prev = attempt_history[-2]
+    failed_statuses = {"FAIL_TO_FAIL", "FAIL_TO_FAIL_IMPORT", "PASS_TO_PASS", "PASS_TO_FAIL"}
+    if last.get("status") not in failed_statuses or prev.get("status") not in failed_statuses:
+        return False
+    return _is_no_progress(attempt_history)
+
+
+def _is_valid_python(code_text):
+    if not code_text.strip():
+        return False, "empty code"
+    try:
+        ast.parse(code_text)
+        return True, ""
+    except SyntaxError as e:
+        return False, f"line {e.lineno}: {e.msg}"
 
 
 def _extract_error_locations(pre_result, post_result, test_code):
@@ -223,14 +472,12 @@ def _extract_error_locations(pre_result, post_result, test_code):
     return errors
 
 
-# ─── Regeneration via Claude API ─────────────────────────────────
+# ─── Regeneration via Ollama API ─────────────────────────────────
 
-def regenerate_test(bug_data, previous_test_code, diagnosis, attempt):
+def regenerate_test(bug_data, previous_test_code, diagnosis, attempt, suggested_path=None, force_rewrite=False):
     """
-    Send the failed test + diagnosis back to Claude for a refined attempt.
+    Send the failed test + diagnosis back to Ollama for a refined attempt.
     """
-    client = anthropic.Anthropic()
-
     # Build context from bug data
     files_section = ""
     for f in bug_data.get("files", []):
@@ -262,6 +509,10 @@ def regenerate_test(bug_data, previous_test_code, diagnosis, attempt):
             if err.get("code"):
                 error_details += f"\n  Code: `{err['code']}`"
             error_details += "\n"
+    if diagnosis.get("missing_modules"):
+        error_details += "\n## Missing Optional Modules\n"
+        for mod in diagnosis["missing_modules"]:
+            error_details += f"- `{mod}`\n"
 
     prompt = f"""You are a senior test engineer. This is ATTEMPT {attempt + 1} of {MAX_RETRIES + 1}.
 
@@ -310,33 +561,62 @@ Fix the test so it achieves **FAIL-TO-PASS**:
 
 ### Key fixes needed based on the diagnosis:
 {"- The test doesn't trigger the bug. Rewrite assertions to test the EXACT buggy behavior." if diagnosis['status'] == 'PASS_TO_PASS' else ""}
-{"- The test has errors on both versions. Fix syntax/import/assertion errors first, then ensure it targets the bug." if diagnosis['status'] == 'FAIL_TO_FAIL' else ""}
+{"- The test has errors on both versions. Fix syntax/import/assertion errors first, then ensure it targets the bug." if diagnosis['status'] in ('FAIL_TO_FAIL', 'FAIL_TO_FAIL_ENV', 'FAIL_TO_FAIL_IMPORT') else ""}
 {"- The assertions are backwards. The test should expect CORRECT behavior (which fails on buggy code)." if diagnosis['status'] == 'PASS_TO_FAIL' else ""}
+{"- Avoid hard dependency on missing optional modules; target core code paths or mock optional modules safely." if diagnosis.get('missing_modules') else ""}
+{"- Start from scratch with a new minimal test (do not preserve previous structure)." if force_rewrite else ""}
 
 ### Rules:
 1. Analyze the error output carefully — fix the SPECIFIC errors shown.
 2. Make sure imports are correct for the project.
+2b. If optional modules are missing, avoid importing optional integration internals directly.
 3. Use the EXACT function/class/method names from the source code.
 4. The test should assert the CORRECT (fixed) behavior, so it fails when the bug is present.
-5. Return ONLY the complete test file content in a single code block.
+5. Return ONLY raw test file code (no markdown fences).
 6. Include a comment at the top with the suggested file path.
+7. If you use pytest decorators or helpers, include `import pytest`.
 """
 
-    print(f"  🤖 Calling Claude API (attempt {attempt + 1})...")
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        messages=[{"role": "user", "content": prompt}],
-        system=(
+    print(f"  🤖 Calling Ollama API (attempt {attempt + 1})...")
+    last_err = ""
+    for regen_try in range(2):
+        system_prompt = (
             "You are an expert test engineer specializing in regression tests. "
             "You are fixing a test that failed verification. Be precise about "
             "imports, function names, and assertions. Analyze the error output carefully."
-        ),
-    )
+        )
+        data = _ollama_chat(messages=[{"role": "user", "content": prompt}], system_prompt=system_prompt)
+        text = data.get("message", {}).get("content", "")
+        candidate = _normalize_python_test_code(_sanitize_test_code(text))
 
-    text = response.content[0].text
-    code_match = re.search(r'```[\w]*\n(.*?)```', text, re.DOTALL)
-    return code_match.group(1) if code_match else text
+        if suggested_path and str(suggested_path).endswith(".py"):
+            ok, err = _is_valid_python(candidate)
+            if ok:
+                bad, reason = _has_repeated_bad_pattern(candidate, diagnosis)
+                if not bad:
+                    if candidate.strip() == (previous_test_code or "").strip():
+                        last_err = "regenerated code unchanged"
+                        prompt += (
+                            "\n\nYour last output was effectively unchanged. "
+                            "Rewrite from scratch with a different strategy."
+                        )
+                        continue
+                    return candidate
+                last_err = reason
+                prompt += (
+                    f"\n\nYour last output repeated a failing pattern ({reason}). "
+                    "Do not reuse that assertion strategy."
+                )
+                continue
+            last_err = err
+            prompt += (
+                f"\n\nYour last output had Python syntax errors ({err}). "
+                "Return ONLY valid Python code, no prose, no markdown fences."
+            )
+            continue
+        return candidate
+
+    raise RuntimeError(f"Regenerated test is not valid Python after retries: {last_err}")
 
 
 # ─── Main Verification with Retry Loop ───────────────────────────
@@ -381,6 +661,12 @@ def verify_single_test(repo_url, test_info, bug_data=None, workspace="workspace"
         print(f"  🔄 {label}{'  (retry)' if is_retry else '  (initial)'}")
         print(f"{'─'*40}")
 
+        if str(suggested_path).endswith(".py") and current_test_source.exists():
+            existing = current_test_source.read_text()
+            normalized = _normalize_python_test_code(existing)
+            if normalized != existing:
+                current_test_source.write_text(normalized)
+
         # Run on BUGGY code
         print(f"  🧪 Running on BUGGY code...")
         pre_passed, pre_result = run_test_at_commit(
@@ -410,6 +696,14 @@ def verify_single_test(repo_url, test_info, bug_data=None, workspace="workspace"
             status = "FAIL_TO_FAIL"
         else:
             status = "PASS_TO_FAIL"
+        missing_modules = _extract_missing_modules(pre_result, post_result)
+        shimmable_missing = _filter_shimmable_modules(missing_modules, clone_dir)
+        preflight_failed = bool(
+            pre_result.get("preflight_collect_failed") or
+            post_result.get("preflight_collect_failed")
+        )
+        if status == "FAIL_TO_FAIL" and (missing_modules or preflight_failed):
+            status = "FAIL_TO_FAIL_IMPORT"
 
         current_test_code = current_test_source.read_text()
 
@@ -422,6 +716,8 @@ def verify_single_test(repo_url, test_info, bug_data=None, workspace="workspace"
             "pre_fix_stderr": pre_result.get("stderr", "")[-500:],
             "post_fix_stdout": post_result.get("stdout", "")[-500:],
             "post_fix_stderr": post_result.get("stderr", "")[-500:],
+            "missing_modules": missing_modules,
+            "shimmable_missing_modules": shimmable_missing,
         }
         attempt_history.append(attempt_record)
 
@@ -452,12 +748,34 @@ def verify_single_test(repo_url, test_info, bug_data=None, workspace="workspace"
             print(f"\n  ⚠️  No bug_data provided — cannot regenerate. Status: {status}")
             break
 
+        if status == "FAIL_TO_FAIL_IMPORT" and str(suggested_path).endswith(".py") and shimmable_missing:
+            shimmed_test = _inject_missing_module_shims(current_test_code, shimmable_missing)
+            shimmed_test = _normalize_python_test_code(shimmed_test)
+            if shimmed_test != current_test_code:
+                shim_path = test_source.parent / f"test_issue_{issue}_attempt{attempt + 1}_shim.py"
+                shim_path.write_text(shimmed_test)
+                current_test_source = shim_path
+                print(f"  🩹 Injected optional-dependency shims: {', '.join(shimmable_missing)}")
+                print(f"  ↩ Retrying with shimmed test: {shim_path.name}")
+                continue
+
         # ── Diagnose & Regenerate ──
         print(f"\n  ⚠️  Status: {status} — diagnosing and regenerating...")
         diagnosis = diagnose_failure(status, pre_result, post_result, current_test_code)
 
         try:
-            new_test_code = regenerate_test(bug_data, current_test_code, diagnosis, attempt)
+            new_test_code = regenerate_test(
+                bug_data,
+                current_test_code,
+                diagnosis,
+                attempt,
+                suggested_path=suggested_path,
+                force_rewrite=_should_force_strict_mode(attempt_history),
+            )
+            if str(suggested_path).endswith(".py") and shimmable_missing:
+                new_test_code = _inject_missing_module_shims(new_test_code, shimmable_missing)
+            if str(suggested_path).endswith(".py"):
+                new_test_code = _normalize_python_test_code(new_test_code)
 
             # Save regenerated test to a new file
             regen_path = test_source.parent / f"test_issue_{issue}_attempt{attempt + 1}.py"
@@ -467,7 +785,7 @@ def verify_single_test(repo_url, test_info, bug_data=None, workspace="workspace"
 
         except Exception as e:
             print(f"  ❌ Regeneration failed: {e}")
-            break
+            continue
 
     # ── All retries exhausted ──
     final_status = attempt_history[-1]["status"] if attempt_history else "UNKNOWN"

@@ -1,3 +1,31 @@
+# generated pipeline outputs
 generated_tests/
 workspace/
-verification_*
+verification_results*.json
+collected_bugs.json
+
+# env/secrets
+.env
+.env.*
+
+# virtualenv
+.venv/
+venv/
+
+# python cache/build
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# editor/os noise
+.DS_Store
+Thumbs.db
+*.swp
+
+# windows ADS metadata (WSL/Windows)
+*:Zone.Identifier

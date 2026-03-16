@@ -273,3 +273,8 @@ Contributions are welcome! Some areas that would benefit from improvement:
 - Retry loop that feeds test failures back to Claude for refinement
 - Parallel verification with multiple repo clones
 - Web UI for browsing results
+
+
+
+jq '[.[] | select((.issue_number==1037) or (.issue_number==923) or (.issue_number==780))]' generated_tests/manifest.json > generated_tests/manifest_remaining.json 
+python3 verify_test_regenerate.py https://github.com/agentscope-ai/agentscope.git generated_tests/manifest_remaining.json collected_bugs.json

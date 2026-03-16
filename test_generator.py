@@ -1,8 +1,84 @@
 # test_generator.py
-import anthropic
 import json
+import os
 from pathlib import Path
 import re
+
+import requests
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "4096"))
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.1"))
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "600"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+
+
+def _ollama_base_urls():
+    urls = []
+    primary = OLLAMA_BASE_URL.rstrip("/")
+    urls.append(primary)
+    if "127.0.0.1:11434" in primary or "localhost:11434" in primary:
+        # WSL fallback: Windows host is usually the resolver nameserver.
+        try:
+            resolv = Path("/etc/resolv.conf").read_text()
+            for line in resolv.splitlines():
+                if line.startswith("nameserver "):
+                    ip = line.split()[1].strip()
+                    if ip:
+                        urls.append(f"http://{ip}:11434")
+                    break
+        except Exception:
+            pass
+    # Preserve order while deduplicating.
+    return list(dict.fromkeys(urls))
+
+
+def _ollama_chat(messages, system_prompt):
+    payload = {
+        "model": OLLAMA_MODEL,
+        "stream": False,
+        "messages": [{"role": "system", "content": system_prompt}] + messages,
+        "options": {
+            "temperature": OLLAMA_TEMPERATURE,
+            "num_ctx": OLLAMA_NUM_CTX,
+            "num_predict": OLLAMA_MAX_TOKENS,
+        },
+    }
+    last_error = None
+    for base in _ollama_base_urls():
+        try:
+            response = requests.post(
+                f"{base}/api/chat",
+                json=payload,
+                timeout=OLLAMA_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            last_error = f"{base}: {e}"
+    raise RuntimeError(f"Ollama request failed for all endpoints. Last error: {last_error}")
+
+
+def _sanitize_test_code(text):
+    """Extract clean code and strip markdown fences/prose artifacts."""
+    if not text:
+        return ""
+    blocks = re.findall(r"```(?:[\w.+-]+)?\n(.*?)```", text, re.DOTALL)
+    candidate = blocks[0] if blocks else text
+    lines = [ln for ln in candidate.splitlines() if not ln.strip().startswith("```")]
+
+    # Drop leading prose and keep from first code-like line.
+    code_start = 0
+    code_markers = ("#", "import ", "from ", "def ", "class ", "@", "async ", "if __name__", '"""', "'''")
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(code_markers):
+            code_start = i
+            break
+    cleaned_lines = lines[code_start:]
+    cleaned = "\n".join(cleaned_lines).strip()
+    return cleaned + "\n" if cleaned else ""
 
 
 def build_prompt(bug_data):
@@ -61,26 +137,15 @@ Return the test as a single code block.
 
 
 def generate_test(bug_data):
-    """Call Claude API to generate a test."""
-    client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY env var
-
+    """Call Ollama API to generate a test."""
     prompt = build_prompt(bug_data)
-
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
+    data = _ollama_chat(
         messages=[{"role": "user", "content": prompt}],
-        system="You are an expert test engineer. Generate precise regression tests."
+        system_prompt="You are an expert test engineer. Generate precise regression tests.",
     )
 
-    # Extract code block from response
-    text = response.content[0].text
-    # Try to extract code from markdown block
-    
-    code_match = re.search(r'```[\w]*\n(.*?)```', text, re.DOTALL)
-    if code_match:
-        return code_match.group(1)
-    return text
+    text = data.get("message", {}).get("content", "")
+    return _sanitize_test_code(text)
 
 
 def generate_all_tests(bugs_file="collected_bugs.json", output_dir="generated_tests"):
