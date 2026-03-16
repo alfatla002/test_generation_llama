@@ -7,6 +7,7 @@ collected_bugs.json
 # env/secrets
 .env
 .env.*
+HANDOFF_NOTES.md
 
 # virtualenv
 .venv/
@@ -29,3 +30,4 @@ Thumbs.db
 
 # windows ADS metadata (WSL/Windows)
 *:Zone.Identifier
+HANDOFF_NOTES.md
